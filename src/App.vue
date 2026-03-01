@@ -1,6 +1,6 @@
 <template>
   <div style="padding: 16px; max-width: 720px; margin: 0 auto;">
-    <h2 :class="['clock', { focus: clockFocus }]">{{ clockLabel }}</h2>
+    <h2 :class="['clock', { focus: clockFocus }]" @click="handleClockTap">{{ clockLabel }}</h2>
 
     <transition name="fade-slide" mode="out-in">
       <div v-if="clockFocus" class="row" style="justify-content: center; margin-bottom: 12px;">
@@ -50,6 +50,14 @@
           <el-button type="primary" :disabled="!connected || !candidateMsg.trim()" @click="sendCandidateMessage">发送</el-button>
         </div>
       </div>
+
+      <div v-if="debugMode" style="margin-top: 12px;">
+        <div class="row" style="justify-content: space-between; align-items: center;">
+          <b>调试日志</b>
+          <el-button size="small" @click="clearLogs">清空</el-button>
+        </div>
+        <div class="logBox"><pre class="logPre">{{ logsText }}</pre></div>
+      </div>
       </el-card>
     </transition>
 
@@ -62,15 +70,6 @@
           {{ requiredPhotoKind === 'paper_check' ? '试卷检查：仅 1 张' : '收卷：可多张' }}
         </div>
       </div>
-
-      <input
-        ref="fileInput"
-        type="file"
-        accept="image/*"
-        capture="environment"
-        @change="onPickFile"
-        style="display:none"
-      />
 
       <div v-if="draftPhotos.length === 0" class="muted">尚未拍照/选择</div>
 
@@ -99,12 +98,53 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
+import { createWsClient, isNativeWsAvailable } from './nativeWs';
+import { Camera, CameraResultType, CameraSource } from '@capacitor/camera';
 
 const serverUrl = (import.meta.env.VITE_SERVER_URL || 'http://localhost:3000').replace(/\/$/, '');
 
 const ws = ref(null);
 const connecting = ref(false);
 const connected = ref(false);
+
+const debugMode = ref(false);
+const logs = ref([]); // { ts, text }
+let clockTapCount = 0;
+let lastClockTapAt = 0;
+
+function logLine(text) {
+  const t = String(text || '').trim();
+  if (!t) return;
+  logs.value.push({ ts: Date.now(), text: t });
+  if (logs.value.length > 200) logs.value.splice(0, logs.value.length - 200);
+}
+
+function clearLogs() {
+  logs.value = [];
+}
+
+const logsText = computed(() => {
+  return logs.value
+    .map((x) => `${new Date(x.ts).toLocaleTimeString()}  ${x.text}`)
+    .join('\n');
+});
+
+function handleClockTap() {
+  const now = Date.now();
+  if (now - lastClockTapAt > 1500) {
+    clockTapCount = 0;
+  }
+  lastClockTapAt = now;
+  clockTapCount += 1;
+  if (clockTapCount >= 10) {
+    clockTapCount = 0;
+    debugMode.value = true;
+    ElMessage.success('调试模式已开启');
+    logLine('DEBUG_MODE_ENABLED');
+  }
+}
+
+let wsClient = null; // { kind, api }
 
 let autoReconnectTimer = null;
 
@@ -126,7 +166,6 @@ let syncTimer = null;
 const photoDialogVisible = ref(false);
 const uploading = ref(false);
 const lastUploadOk = ref(false);
-const fileInput = ref(null);
 
 const draftPhotos = ref([]); // { id, file, previewUrl }
 const addDisabled = computed(() => requiredPhotoKind.value === 'paper_check' && draftPhotos.value.length >= 1);
@@ -166,21 +205,22 @@ const photoHint = computed(() => {
 function wsUrl() {
   const u = new URL(serverUrl);
   u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
-  u.pathname = '/ws';
+  u.pathname = '/socket.io';
   u.search = '?role=candidate';
   return u.toString();
 }
 
 function sendAck(commandType) {
   try {
-    ws.value?.send(JSON.stringify({ type: 'ack', ts: Date.now(), commandType }));
+    wsClient?.api?.send?.(JSON.stringify({ type: 'ack', ts: Date.now(), commandType }));
   } catch {}
 }
 
 function sendPing() {
   if (!connected.value) return;
   try {
-    ws.value?.send(JSON.stringify({ type: 'ping', ts: Date.now(), payload: { clientTs: Date.now() } }));
+    const payload = JSON.stringify({ type: 'ping', ts: Date.now(), payload: { clientTs: Date.now() } });
+    wsClient?.api?.send?.(payload);
   } catch {}
 }
 
@@ -189,7 +229,8 @@ function sendCandidateMessage() {
   if (!text) return;
   if (!connected.value) return;
   try {
-    ws.value?.send(JSON.stringify({ type: 'candidate_message', ts: Date.now(), payload: { text } }));
+    const payload = JSON.stringify({ type: 'candidate_message', ts: Date.now(), payload: { text } });
+    wsClient?.api?.send?.(payload);
     candidateMsg.value = '';
     ElMessage.success('已发送');
   } catch {
@@ -202,7 +243,8 @@ function sendNotifyReceipt(text) {
   if (!t) return;
   if (!connected.value) return;
   try {
-    ws.value?.send(JSON.stringify({ type: 'notify_receipt', ts: Date.now(), payload: { text: t } }));
+    const payload = JSON.stringify({ type: 'notify_receipt', ts: Date.now(), payload: { text: t } });
+    wsClient?.api?.send?.(payload);
   } catch {}
 }
 
@@ -277,14 +319,47 @@ function sendTimerSync() {
   if (!connected.value) return;
   if (phase.value !== 'in_progress') return;
   try {
-    ws.value?.send(
-      JSON.stringify({
-        type: 'timer_sync',
-        ts: Date.now(),
-        payload: { mode: clockMode.value, valueSec: clockValueSec.value },
-      })
-    );
+    const payload = JSON.stringify({
+      type: 'timer_sync',
+      ts: Date.now(),
+      payload: { mode: clockMode.value, valueSec: clockValueSec.value },
+    });
+    wsClient?.api?.send?.(payload);
   } catch {}
+}
+
+function cleanupSocket() {
+  try {
+    wsClient?.api?.dispose?.();
+  } catch {}
+  wsClient = null;
+  ws.value = null;
+}
+
+function handleIncomingText(text) {
+  let msg;
+  try { msg = JSON.parse(text); } catch { return; }
+
+  if (debugMode.value) {
+    const mt = String(msg?.type || '').trim();
+    if (mt) logLine(`RECV type=${mt}`);
+  }
+
+  if (msg?.type === 'hello') {
+    applySnapshot(msg.data);
+    return;
+  }
+
+  if (msg?.type === 'command') {
+    handleCommand(msg.command);
+  }
+
+  if (msg?.type === 'pong') {
+    const clientTs = Number(msg?.payload?.clientTs);
+    if (Number.isFinite(clientTs) && clientTs > 0) {
+      latencyMs.value = Math.max(0, Math.floor(Date.now() - clientTs));
+    }
+  }
 }
 
 function startTimersIfNeeded() {
@@ -566,31 +641,29 @@ function connect() {
   connected.value = false;
   latencyMs.value = null;
 
-  if (ws.value) {
-    try { ws.value.close(); } catch {}
-    ws.value = null;
-  }
+  cleanupSocket();
 
-  const socket = new WebSocket(wsUrl());
-  ws.value = socket;
+  const url = wsUrl();
+  wsClient = createWsClient(url);
 
-  socket.onopen = () => {
+  logLine(`CONNECT kind=${wsClient.kind} url=${url}`);
+
+  wsClient.api.on('open', () => {
     connecting.value = false;
     connected.value = true;
-    // 连接恢复后停止自动重连轮询
     if (autoReconnectTimer) {
       clearInterval(autoReconnectTimer);
       autoReconnectTimer = null;
     }
-    // 连接上后，如果正在考试，尽快同步一次
     sendTimerSync();
-
     if (pingTimer) clearInterval(pingTimer);
     pingTimer = setInterval(() => sendPing(), 5000);
     sendPing();
-  };
 
-  socket.onclose = () => {
+    logLine('OPEN');
+  });
+
+  wsClient.api.on('close', () => {
     connecting.value = false;
     connected.value = false;
     latencyMs.value = null;
@@ -598,38 +671,44 @@ function connect() {
       clearInterval(pingTimer);
       pingTimer = null;
     }
-    if (ws.value === socket) ws.value = null;
     ensureAutoReconnect();
-  };
 
-  socket.onerror = () => {
+    logLine('CLOSE');
+  });
+
+  wsClient.api.on('error', (ev) => {
     connecting.value = false;
     connected.value = false;
     latencyMs.value = null;
-    if (ws.value === socket) ws.value = null;
+    const msg = String(ev?.message || ev?.name || '').trim();
+    if (msg) {
+      ElMessage.error(`WebSocket 连接失败：${msg}`);
+    } else {
+      ElMessage.error('WebSocket 连接失败');
+    }
+    const extra = [];
+    if (ev?.name) extra.push(String(ev.name));
+    if (ev?.httpCode != null) extra.push(`httpCode=${ev.httpCode}`);
+    if (ev?.httpMessage) extra.push(`httpMessage=${String(ev.httpMessage)}`);
+    logLine(`ERROR ${[msg, ...extra].filter(Boolean).join(' | ')}`.trim());
+    if (debugMode.value && ev?.stack) {
+      logLine(String(ev.stack));
+    }
     ensureAutoReconnect();
-  };
+  });
 
-  socket.onmessage = (ev) => {
-    let msg;
-    try { msg = JSON.parse(ev.data); } catch { return; }
+  wsClient.api.on('message', (ev) => {
+    handleIncomingText(ev?.text);
+  });
 
-    if (msg?.type === 'hello') {
-      applySnapshot(msg.data);
-      return;
-    }
-
-    if (msg?.type === 'command') {
-      handleCommand(msg.command);
-    }
-
-    if (msg?.type === 'pong') {
-      const clientTs = Number(msg?.payload?.clientTs);
-      if (Number.isFinite(clientTs) && clientTs > 0) {
-        latencyMs.value = Math.max(0, Math.floor(Date.now() - clientTs));
-      }
-    }
-  };
+  wsClient.api.connect().catch((e) => {
+    connecting.value = false;
+    connected.value = false;
+    const msg = String(e?.message || e || '').trim();
+    logLine(`CONNECT_CALL_FAILED ${msg}`.trim());
+    if (msg) ElMessage.error(`连接调用失败：${msg}`);
+    ensureAutoReconnect();
+  });
 }
 
 function reconnect() {
@@ -666,35 +745,47 @@ function clearDraft() {
     } catch {}
   }
   draftPhotos.value = [];
-  if (fileInput.value) fileInput.value.value = '';
 }
 
-function onPickFile(e) {
-  const file = e.target?.files?.[0] || null;
-  if (!file) return;
+async function triggerPick() {
+  if (!requiredPhotoKind.value) return;
+  if (addDisabled.value) return;
 
   if (requiredPhotoKind.value === 'paper_check') {
     clearDraft();
   }
 
-  if (requiredPhotoKind.value === 'paper_check' && draftPhotos.value.length >= 1) {
-    return;
+  try {
+    const p = await Camera.getPhoto({
+      source: CameraSource.Camera,
+      resultType: CameraResultType.Uri,
+      quality: 90,
+      saveToGallery: false,
+    });
+
+    const webPath = p?.webPath;
+    if (!webPath) {
+      ElMessage.error('拍照失败：未返回图片地址');
+      return;
+    }
+
+    const resp = await fetch(webPath);
+    const blob = await resp.blob();
+    const ext = (blob.type && blob.type.includes('/')) ? blob.type.split('/')[1] : 'jpg';
+    const filename = `photo_${Date.now()}.${ext}`;
+    const file = new File([blob], filename, { type: blob.type || 'image/jpeg' });
+    const previewUrl = URL.createObjectURL(file);
+
+    draftPhotos.value.push({
+      id: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
+      file,
+      previewUrl,
+    });
+  } catch (e) {
+    const msg = String(e?.message || e || '').toLowerCase();
+    if (msg.includes('cancel') || msg.includes('canceled')) return;
+    ElMessage.error('拍照失败');
   }
-
-  const previewUrl = URL.createObjectURL(file);
-  draftPhotos.value.push({
-    id: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
-    file,
-    previewUrl,
-  });
-
-  if (fileInput.value) fileInput.value.value = '';
-}
-
-function triggerPick() {
-  if (!requiredPhotoKind.value) return;
-  if (addDisabled.value) return;
-  fileInput.value?.click();
 }
 
 function removeDraft(id) {
@@ -759,7 +850,7 @@ onMounted(() => {
 });
 onBeforeUnmount(() => {
   stopTimers();
-  try { ws.value?.close(); } catch {}
+  cleanupSocket();
   clearDraft();
   if (autoReconnectTimer) {
     clearInterval(autoReconnectTimer);
@@ -774,7 +865,7 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .clock { margin: 0 0 12px; text-align: center; font-size: 56px; font-weight: 700; transition: font-size 200ms ease, margin 200ms ease; }
-.clock.focus { font-size: 96px; margin-bottom: 16px; }
+.clock.focus { font-size: clamp(110px, 20vw, 180px); margin-bottom: 16px; }
 .row { display:flex; gap: 8px; flex-wrap: wrap; }
 .msgRow { display:flex; gap: 8px; flex-wrap: nowrap; align-items: center; }
 .msgInput { flex: 1; min-width: 0; }

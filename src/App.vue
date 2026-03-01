@@ -111,6 +111,9 @@ let autoReconnectTimer = null;
 const latencyMs = ref(null);
 let pingTimer = null;
 
+let listeningAudio = null;
+const listeningAudioUrl = ref('');
+
 const phase = ref('idle');
 const lastNotification = ref('');
 const requiredPhotoKind = ref(null); // 'paper_check' | 'collect_paper' | null
@@ -322,7 +325,7 @@ function startTimersIfNeeded() {
 
   syncTimer = setInterval(() => {
     sendTimerSync();
-  }, 10000);
+  }, 1000);
 
   // 立刻同步一次
   sendTimerSync();
@@ -407,6 +410,73 @@ async function handleCommand(command) {
     case 'ui_controls': {
       const visible = command?.payload?.visible !== false;
       clockFocus.value = !visible;
+      break;
+    }
+    case 'listening_open': {
+      const url = String(command?.payload?.audioUrl || '').trim();
+      if (!url) break;
+      const abs = url.startsWith('http') ? url : `${serverUrl}${url}`;
+      listeningAudioUrl.value = abs;
+      if (!listeningAudio) {
+        listeningAudio = new Audio();
+        listeningAudio.preload = 'auto';
+      }
+      listeningAudio.src = abs;
+      // 不自动播放，等待监考端下发 play
+      ElMessage.success('已开启听力');
+      break;
+    }
+    case 'listening_play': {
+      if (!listeningAudio) {
+        ElMessage.error('未开启听力');
+        break;
+      }
+      try {
+        const p = listeningAudio.play();
+        if (p && typeof p.then === 'function') {
+          await p;
+        }
+      } catch {
+        // 可能被浏览器/安卓 WebView 的自动播放策略阻止
+        try {
+          await ElMessageBox.alert('请点击“确认”以允许播放听力', '听力播放', {
+            confirmButtonText: '确认',
+            closeOnClickModal: false,
+            closeOnPressEscape: false,
+            showClose: false,
+          });
+          await listeningAudio.play();
+        } catch {
+          ElMessage.error('播放被阻止');
+        }
+      }
+      break;
+    }
+    case 'listening_pause': {
+      if (!listeningAudio) break;
+      try { listeningAudio.pause(); } catch {}
+      break;
+    }
+    case 'listening_seek': {
+      if (!listeningAudio) break;
+      const percent = Number(command?.payload?.percent);
+      if (!Number.isFinite(percent)) break;
+      const dur = Number(listeningAudio.duration);
+      if (!Number.isFinite(dur) || dur <= 0) {
+        ElMessage.warning('音频尚未就绪，无法跳转进度');
+        break;
+      }
+      const target = Math.max(0, Math.min(dur, (dur * percent) / 100));
+      try { listeningAudio.currentTime = target; } catch {}
+      break;
+    }
+    case 'listening_close': {
+      if (listeningAudio) {
+        try { listeningAudio.pause(); } catch {}
+        try { listeningAudio.src = ''; } catch {}
+      }
+      listeningAudioUrl.value = '';
+      ElMessage.success('已关闭听力');
       break;
     }
     case 'clock_set': {
@@ -528,12 +598,16 @@ function connect() {
       clearInterval(pingTimer);
       pingTimer = null;
     }
+    if (ws.value === socket) ws.value = null;
+    ensureAutoReconnect();
   };
 
   socket.onerror = () => {
     connecting.value = false;
     connected.value = false;
     latencyMs.value = null;
+    if (ws.value === socket) ws.value = null;
+    ensureAutoReconnect();
   };
 
   socket.onmessage = (ev) => {

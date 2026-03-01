@@ -194,6 +194,15 @@ function sendCandidateMessage() {
   }
 }
 
+function sendNotifyReceipt(text) {
+  const t = String(text || '').trim();
+  if (!t) return;
+  if (!connected.value) return;
+  try {
+    ws.value?.send(JSON.stringify({ type: 'notify_receipt', ts: Date.now(), payload: { text: t } }));
+  } catch {}
+}
+
 function formatClock(sec) {
   sec = Math.max(0, Math.floor(sec || 0));
   const mm = String(Math.floor(sec / 60)).padStart(2, '0');
@@ -442,6 +451,9 @@ async function handleCommand(command) {
         } catch {
           // 理论上不会进入（已禁用 ESC/遮罩/关闭按钮），但兜底不阻塞后续流程
         }
+
+        // 签收回报给监考端
+        sendNotifyReceipt(text);
       }
       sendAck(command?.type);
       break;

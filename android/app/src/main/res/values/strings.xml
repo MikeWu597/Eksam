@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Eksam</string>
+    <string name="title_activity_main">Eksam</string>
+    <string name="package_name">com.eksam.app</string>
+    <string name="custom_url_scheme">com.eksam.app</string>
+</resources>

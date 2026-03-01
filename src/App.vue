@@ -1,15 +1,25 @@
 <template>
   <div style="padding: 16px; max-width: 720px; margin: 0 auto;">
-    <h2 style="margin: 0 0 12px;">考生端</h2>
+    <h2 :class="['clock', { focus: clockFocus }]">{{ clockLabel }}</h2>
 
-    <el-card>
+    <transition name="fade-slide" mode="out-in">
+      <div v-if="clockFocus" class="row" style="justify-content: center; margin-bottom: 12px;">
+        <el-button type="primary" @click="clockFocus = false">展开</el-button>
+      </div>
+    </transition>
+
+    <transition name="fade-slide" mode="out-in">
+      <el-card v-if="!clockFocus">
       <template #header>
         <div style="display:flex; justify-content: space-between; align-items: center; gap: 12px;">
           <div>
             <div><b>连接状态：</b>{{ connectionLabel }}</div>
             <div><b>考试状态：</b>{{ phaseLabel }}</div>
           </div>
-          <el-button :disabled="connecting" @click="reconnect">重连</el-button>
+          <div class="row" style="justify-content: flex-end;">
+            <el-button :disabled="connecting" @click="reconnect">重连</el-button>
+            <el-button :disabled="connecting" @click="enterClockFocus">时钟</el-button>
+          </div>
         </div>
       </template>
 
@@ -25,43 +35,64 @@
         style="margin-bottom: 12px;"
       />
 
-      <div class="row">
-        <el-button type="primary" :disabled="!requiredPhotoKind" @click="openPhotoDialog">拍照并上传</el-button>
-        <el-button :disabled="!requiredPhotoKind" @click="clearSelected">清空选择</el-button>
+      <div v-if="requiredPhotoKind" class="row">
+        <el-button type="primary" @click="openPhotoDialog">拍照</el-button>
+        <el-button @click="clearDraft">清空</el-button>
       </div>
 
-      <div style="margin-top: 12px;" v-if="selectedFileName">
-        <div><b>已选择：</b>{{ selectedFileName }}</div>
-      </div>
-
-      <div style="margin-top: 12px;" v-if="uploadResultUrl">
+      <div style="margin-top: 12px;" v-if="lastUploadOk">
         <el-alert title="已上传成功" type="success" show-icon />
-        <div style="margin-top: 8px;">
-          <a :href="uploadResultUrl" target="_blank">查看上传的图片</a>
+      </div>
+
+      <div style="margin-top: 12px;">
+        <div class="msgRow">
+          <el-input class="msgInput" v-model="candidateMsg" placeholder="给监考端发送消息" :disabled="!connected" />
+          <el-button type="primary" :disabled="!connected || !candidateMsg.trim()" @click="sendCandidateMessage">发送</el-button>
         </div>
       </div>
-    </el-card>
+      </el-card>
+    </transition>
 
-    <el-dialog v-model="photoDialogVisible" title="拍照" width="95%" :close-on-click-modal="false">
-      <div>
-        <input
-          ref="fileInput"
-          type="file"
-          accept="image/*"
-          capture="environment"
-          @change="onPickFile"
-        />
+    <el-dialog v-model="photoDialogVisible" title="拍照预览" width="95%" :close-on-click-modal="false">
+      <div class="row" style="align-items:center; margin-bottom: 12px;">
+        <el-button type="primary" :disabled="uploading || addDisabled" @click="triggerPick">
+          {{ requiredPhotoKind === 'collect_paper' ? '添加一张' : '选择照片' }}
+        </el-button>
+        <div class="muted">
+          {{ requiredPhotoKind === 'paper_check' ? '试卷检查：仅 1 张' : '收卷：可多张' }}
+        </div>
+      </div>
+
+      <input
+        ref="fileInput"
+        type="file"
+        accept="image/*"
+        capture="environment"
+        @change="onPickFile"
+        style="display:none"
+      />
+
+      <div v-if="draftPhotos.length === 0" class="muted">尚未拍照/选择</div>
+
+      <div v-else class="grid">
+        <div v-for="p in draftPhotos" :key="p.id" class="thumb">
+          <img :src="p.previewUrl" alt="preview" />
+          <div class="row" style="justify-content: space-between; margin-top: 6px;">
+            <div class="muted" style="max-width: 72%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+              {{ p.file.name }}
+            </div>
+            <el-button size="small" :disabled="uploading" @click="removeDraft(p.id)">移除</el-button>
+          </div>
+        </div>
       </div>
 
       <template #footer>
-        <el-button @click="photoDialogVisible = false">取消</el-button>
-        <el-button type="primary" :disabled="!selectedFile || uploading" :loading="uploading" @click="upload">上传</el-button>
+        <el-button :disabled="uploading" @click="photoDialogVisible = false">取消</el-button>
+        <el-button type="primary" :disabled="draftPhotos.length === 0 || uploading" :loading="uploading" @click="uploadAll">
+          确认上传
+        </el-button>
       </template>
     </el-dialog>
-
-    <div style="margin-top: 12px;" class="muted">
-      服务器：{{ serverUrl }}
-    </div>
   </div>
 </template>
 
@@ -75,20 +106,37 @@ const ws = ref(null);
 const connecting = ref(false);
 const connected = ref(false);
 
+let autoReconnectTimer = null;
+
+const latencyMs = ref(null);
+let pingTimer = null;
+
 const phase = ref('idle');
 const lastNotification = ref('');
 const requiredPhotoKind = ref(null); // 'paper_check' | 'collect_paper' | null
 
+const clockMode = ref('up'); // 'up' | 'down'
+const clockValueSec = ref(0); // up: elapsed, down: remaining
+let tickTimer = null;
+let syncTimer = null;
+
 const photoDialogVisible = ref(false);
-const selectedFile = ref(null);
-const selectedFileName = ref('');
 const uploading = ref(false);
-const uploadResultUrl = ref('');
+const lastUploadOk = ref(false);
 const fileInput = ref(null);
+
+const draftPhotos = ref([]); // { id, file, previewUrl }
+const addDisabled = computed(() => requiredPhotoKind.value === 'paper_check' && draftPhotos.value.length >= 1);
+
+const clockFocus = ref(false);
+
+const candidateMsg = ref('');
 
 const connectionLabel = computed(() => {
   if (connecting.value) return '连接中';
-  return connected.value ? '已连接' : '未连接';
+  if (!connected.value) return '未连接';
+  if (latencyMs.value == null) return '延迟 -';
+  return `延迟 ${latencyMs.value}ms`;
 });
 
 const phaseLabel = computed(() => {
@@ -103,6 +151,8 @@ const phaseLabel = computed(() => {
   };
   return map[phase.value] || phase.value;
 });
+
+const clockLabel = computed(() => formatClock(clockValueSec.value));
 
 const photoHint = computed(() => {
   if (requiredPhotoKind.value === 'paper_check') return '请按要求拍摄“试卷检查”照片并上传';
@@ -124,14 +174,183 @@ function sendAck(commandType) {
   } catch {}
 }
 
+function sendPing() {
+  if (!connected.value) return;
+  try {
+    ws.value?.send(JSON.stringify({ type: 'ping', ts: Date.now(), payload: { clientTs: Date.now() } }));
+  } catch {}
+}
+
+function sendCandidateMessage() {
+  const text = candidateMsg.value.trim();
+  if (!text) return;
+  if (!connected.value) return;
+  try {
+    ws.value?.send(JSON.stringify({ type: 'candidate_message', ts: Date.now(), payload: { text } }));
+    candidateMsg.value = '';
+    ElMessage.success('已发送');
+  } catch {
+    ElMessage.error('发送失败');
+  }
+}
+
+function formatClock(sec) {
+  sec = Math.max(0, Math.floor(sec || 0));
+  const mm = String(Math.floor(sec / 60)).padStart(2, '0');
+  const ss = String(sec % 60).padStart(2, '0');
+  return `${mm}:${ss}`;
+}
+
+function getStartAt() {
+  const raw = localStorage.getItem('eksam_examStartAt');
+  const v = Number(raw);
+  return Number.isFinite(v) && v > 0 ? v : null;
+}
+
+function setStartAt(ms) {
+  localStorage.setItem('eksam_examStartAt', String(ms));
+}
+
+function clearStartAt() {
+  localStorage.removeItem('eksam_examStartAt');
+}
+
+function getClockMode() {
+  const v = localStorage.getItem('eksam_clockMode');
+  return v === 'down' ? 'down' : 'up';
+}
+
+function setClockMode(mode) {
+  localStorage.setItem('eksam_clockMode', mode === 'down' ? 'down' : 'up');
+}
+
+function clearClockMode() {
+  localStorage.removeItem('eksam_clockMode');
+}
+
+function getEndAt() {
+  const raw = localStorage.getItem('eksam_examEndAt');
+  const v = Number(raw);
+  return Number.isFinite(v) && v > 0 ? v : null;
+}
+
+function setEndAt(ms) {
+  localStorage.setItem('eksam_examEndAt', String(ms));
+}
+
+function clearEndAt() {
+  localStorage.removeItem('eksam_examEndAt');
+}
+
+function computeElapsedFromStartAt(startAt) {
+  return Math.max(0, Math.floor((Date.now() - startAt) / 1000));
+}
+
+function computeRemainingFromEndAt(endAt) {
+  return Math.max(0, Math.floor((endAt - Date.now()) / 1000));
+}
+
+function stopTimers() {
+  if (tickTimer) {
+    clearInterval(tickTimer);
+    tickTimer = null;
+  }
+  if (syncTimer) {
+    clearInterval(syncTimer);
+    syncTimer = null;
+  }
+}
+
+function sendTimerSync() {
+  if (!connected.value) return;
+  if (phase.value !== 'in_progress') return;
+  try {
+    ws.value?.send(
+      JSON.stringify({
+        type: 'timer_sync',
+        ts: Date.now(),
+        payload: { mode: clockMode.value, valueSec: clockValueSec.value },
+      })
+    );
+  } catch {}
+}
+
+function startTimersIfNeeded() {
+  stopTimers();
+
+  if (phase.value !== 'in_progress') return;
+  clockMode.value = getClockMode();
+
+  if (clockMode.value === 'down') {
+    const endAt = getEndAt();
+    if (!endAt) return;
+    clockValueSec.value = computeRemainingFromEndAt(endAt);
+  } else {
+    const startAt = getStartAt();
+    if (!startAt) return;
+    clockValueSec.value = computeElapsedFromStartAt(startAt);
+  }
+
+  tickTimer = setInterval(() => {
+    clockMode.value = getClockMode();
+    if (clockMode.value === 'down') {
+      const e = getEndAt();
+      if (!e) return;
+      clockValueSec.value = computeRemainingFromEndAt(e);
+      if (clockValueSec.value <= 0) {
+        clockValueSec.value = 0;
+        // 倒计时到 0 后停止同步/计时
+        stopTimers();
+        sendTimerSync();
+      }
+      return;
+    }
+
+    const s = getStartAt();
+    if (!s) return;
+    clockValueSec.value = computeElapsedFromStartAt(s);
+  }, 1000);
+
+  syncTimer = setInterval(() => {
+    sendTimerSync();
+  }, 10000);
+
+  // 立刻同步一次
+  sendTimerSync();
+}
+
 function applySnapshot(snapshot) {
   if (!snapshot) return;
   if (snapshot.phase) phase.value = snapshot.phase;
   requiredPhotoKind.value = snapshot.pendingPhotoKind || null;
+
+  // 如果服务端已有时钟，而本地没有 startAt，则用它推算 startAt
+  if (phase.value === 'in_progress') {
+    const snapMode = snapshot.examClockMode === 'down' ? 'down' : 'up';
+    setClockMode(snapMode);
+    const sec = Number(snapshot.examClockSec);
+    if (Number.isFinite(sec) && sec >= 0) {
+      if (snapMode === 'down') {
+        if (!getEndAt()) setEndAt(Date.now() + Math.floor(sec) * 1000);
+      } else {
+        if (!getStartAt()) setStartAt(Date.now() - Math.floor(sec) * 1000);
+      }
+    }
+  }
+
+  if (phase.value !== 'in_progress') {
+    clockValueSec.value = 0;
+    clearStartAt();
+    clearEndAt();
+    clearClockMode();
+  }
+
+  startTimersIfNeeded();
 }
 
-function handleCommand(command) {
-  uploadResultUrl.value = '';
+async function handleCommand(command) {
+  lastUploadOk.value = false;
+  clearDraft();
 
   switch (command?.type) {
     case 'open_exam':
@@ -146,16 +365,94 @@ function handleCommand(command) {
     case 'start_exam':
       phase.value = 'in_progress';
       requiredPhotoKind.value = null;
+      // 开考不归零：优先使用服务端下发的当前时钟值/模式；否则沿用本地已设置的时钟
+      if (command?.payload && (command.payload.mode || command.payload.sec != null)) {
+        const mode = command?.payload?.mode === 'down' ? 'down' : 'up';
+        const sec = Number(command?.payload?.sec);
+        if (Number.isFinite(sec) && sec >= 0) {
+          clockMode.value = mode;
+          setClockMode(mode);
+          clockValueSec.value = Math.floor(sec);
+          if (mode === 'down') {
+            clearStartAt();
+            setEndAt(Date.now() + Math.floor(sec) * 1000);
+          } else {
+            clearEndAt();
+            setStartAt(Date.now() - Math.floor(sec) * 1000);
+          }
+        }
+      } else {
+        // 没有 payload 时，不改动现有锚点；如果从未设置过，则默认从 00:00 正计时
+        const mode = getClockMode();
+        if (!getStartAt() && !getEndAt()) {
+          clockMode.value = mode;
+          setClockMode(mode);
+          clockValueSec.value = 0;
+          clearEndAt();
+          setStartAt(Date.now());
+        }
+      }
+      startTimersIfNeeded();
       ElMessage.success('已开考');
       break;
+    case 'ui_controls': {
+      const visible = command?.payload?.visible !== false;
+      clockFocus.value = !visible;
+      break;
+    }
+    case 'clock_set': {
+      const mode = command?.payload?.mode === 'down' ? 'down' : 'up';
+      const sec = Number(command?.payload?.sec);
+      if (!Number.isFinite(sec) || sec < 0) break;
+
+      const normalizedSec = Math.floor(sec);
+      clockValueSec.value = normalizedSec;
+
+      clockMode.value = mode;
+      setClockMode(mode);
+
+      if (mode === 'down') {
+        clearStartAt();
+        setEndAt(Date.now() + normalizedSec * 1000);
+      } else {
+        clearEndAt();
+        setStartAt(Date.now() - normalizedSec * 1000);
+      }
+
+      // 若在考试中：立即刷新并开始计时/同步；否则仅更新显示
+      if (phase.value === 'in_progress') {
+        startTimersIfNeeded();
+        sendTimerSync();
+      } else {
+        stopTimers();
+      }
+      break;
+    }
     case 'notify': {
       const text = String(command?.payload?.text || '');
       lastNotification.value = text;
-      if (text) ElMessage.info(text);
+      if (text) {
+        try {
+          await ElMessageBox.alert(text, '考试通知', {
+            confirmButtonText: '签收',
+            closeOnClickModal: false,
+            closeOnPressEscape: false,
+            showClose: false,
+          });
+        } catch {
+          // 理论上不会进入（已禁用 ESC/遮罩/关闭按钮），但兜底不阻塞后续流程
+        }
+      }
+      sendAck(command?.type);
       break;
     }
     case 'end_exam':
       phase.value = 'ended';
+      stopTimers();
+      clockValueSec.value = 0;
+      clearStartAt();
+      clearEndAt();
+      clearClockMode();
       ElMessage.warning('已下考');
       break;
     case 'collect_paper':
@@ -166,18 +463,26 @@ function handleCommand(command) {
     case 'close_exam':
       phase.value = 'closed';
       requiredPhotoKind.value = null;
+      stopTimers();
+      clockValueSec.value = 0;
+      clearStartAt();
+      clearEndAt();
+      clearClockMode();
       ElMessage.success('考试已关闭');
       break;
     default:
       break;
   }
 
-  sendAck(command?.type);
+  if (command?.type !== 'notify') {
+    sendAck(command?.type);
+  }
 }
 
 function connect() {
   connecting.value = true;
   connected.value = false;
+  latencyMs.value = null;
 
   if (ws.value) {
     try { ws.value.close(); } catch {}
@@ -190,16 +495,33 @@ function connect() {
   socket.onopen = () => {
     connecting.value = false;
     connected.value = true;
+    // 连接恢复后停止自动重连轮询
+    if (autoReconnectTimer) {
+      clearInterval(autoReconnectTimer);
+      autoReconnectTimer = null;
+    }
+    // 连接上后，如果正在考试，尽快同步一次
+    sendTimerSync();
+
+    if (pingTimer) clearInterval(pingTimer);
+    pingTimer = setInterval(() => sendPing(), 5000);
+    sendPing();
   };
 
   socket.onclose = () => {
     connecting.value = false;
     connected.value = false;
+    latencyMs.value = null;
+    if (pingTimer) {
+      clearInterval(pingTimer);
+      pingTimer = null;
+    }
   };
 
   socket.onerror = () => {
     connecting.value = false;
     connected.value = false;
+    latencyMs.value = null;
   };
 
   socket.onmessage = (ev) => {
@@ -214,6 +536,13 @@ function connect() {
     if (msg?.type === 'command') {
       handleCommand(msg.command);
     }
+
+    if (msg?.type === 'pong') {
+      const clientTs = Number(msg?.payload?.clientTs);
+      if (Number.isFinite(clientTs) && clientTs > 0) {
+        latencyMs.value = Math.max(0, Math.floor(Date.now() - clientTs));
+      }
+    }
   };
 }
 
@@ -221,65 +550,155 @@ function reconnect() {
   connect();
 }
 
+function ensureAutoReconnect() {
+  if (autoReconnectTimer) return;
+  autoReconnectTimer = setInterval(() => {
+    if (connected.value) return;
+    if (connecting.value) return;
+    connect();
+  }, 5000);
+}
+
+function enterClockFocus() {
+  // 最小化面板：关闭可能打开的弹窗，并清理草稿预览
+  photoDialogVisible.value = false;
+  lastUploadOk.value = false;
+  clearDraft();
+  clockFocus.value = true;
+}
+
 function openPhotoDialog() {
   if (!requiredPhotoKind.value) return;
+  lastUploadOk.value = false;
   photoDialogVisible.value = true;
 }
 
-function clearSelected() {
-  selectedFile.value = null;
-  selectedFileName.value = '';
+function clearDraft() {
+  for (const p of draftPhotos.value) {
+    try {
+      URL.revokeObjectURL(p.previewUrl);
+    } catch {}
+  }
+  draftPhotos.value = [];
   if (fileInput.value) fileInput.value.value = '';
 }
 
 function onPickFile(e) {
   const file = e.target?.files?.[0] || null;
-  selectedFile.value = file;
-  selectedFileName.value = file?.name || '';
+  if (!file) return;
+
+  if (requiredPhotoKind.value === 'paper_check') {
+    clearDraft();
+  }
+
+  if (requiredPhotoKind.value === 'paper_check' && draftPhotos.value.length >= 1) {
+    return;
+  }
+
+  const previewUrl = URL.createObjectURL(file);
+  draftPhotos.value.push({
+    id: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
+    file,
+    previewUrl,
+  });
+
+  if (fileInput.value) fileInput.value.value = '';
 }
 
-async function upload() {
+function triggerPick() {
+  if (!requiredPhotoKind.value) return;
+  if (addDisabled.value) return;
+  fileInput.value?.click();
+}
+
+function removeDraft(id) {
+  const idx = draftPhotos.value.findIndex((p) => p.id === id);
+  if (idx < 0) return;
+  const [removed] = draftPhotos.value.splice(idx, 1);
+  try {
+    URL.revokeObjectURL(removed.previewUrl);
+  } catch {}
+}
+
+async function uploadSingle(file) {
+  const fd = new FormData();
+  fd.append('kind', requiredPhotoKind.value);
+  fd.append('photo', file);
+
+  const r = await fetch(`${serverUrl}/api/candidate/photo`, { method: 'POST', body: fd });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || j.ok !== true) {
+    ElMessage.error(`上传失败：${j.error || r.status}`);
+    return false;
+  }
+  return true;
+}
+
+async function uploadAll() {
   if (!requiredPhotoKind.value) {
     ElMessage.error('当前未要求拍照');
     return;
   }
-  if (!selectedFile.value) {
-    ElMessage.error('请先选择/拍摄照片');
+  if (draftPhotos.value.length === 0) {
+    ElMessage.error('请先拍照/选择照片');
+    return;
+  }
+  if (requiredPhotoKind.value === 'paper_check' && draftPhotos.value.length !== 1) {
+    ElMessage.error('试卷检查必须上传 1 张图片');
     return;
   }
 
   uploading.value = true;
   try {
-    const fd = new FormData();
-    fd.append('kind', requiredPhotoKind.value);
-    fd.append('photo', selectedFile.value);
-
-    const r = await fetch(`${serverUrl}/api/candidate/photo`, { method: 'POST', body: fd });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok || j.ok !== true) {
-      ElMessage.error(`上传失败：${j.error || r.status}`);
-      return;
+    for (const p of draftPhotos.value) {
+      const ok = await uploadSingle(p.file);
+      if (!ok) return;
     }
 
-    uploadResultUrl.value = `${serverUrl}${j.url}`;
+    lastUploadOk.value = true;
     ElMessage.success('上传成功');
 
-    // 成功后等待服务端解除 pending（也允许客户端先清掉）
+    // 成功后结束本次拍照要求
     requiredPhotoKind.value = null;
-    clearSelected();
+    clearDraft();
+    photoDialogVisible.value = false;
   } finally {
     uploading.value = false;
-    photoDialogVisible.value = false;
   }
 }
 
-onMounted(() => connect());
+onMounted(() => {
+  connect();
+  ensureAutoReconnect();
+});
 onBeforeUnmount(() => {
+  stopTimers();
   try { ws.value?.close(); } catch {}
+  clearDraft();
+  if (autoReconnectTimer) {
+    clearInterval(autoReconnectTimer);
+    autoReconnectTimer = null;
+  }
+  if (pingTimer) {
+    clearInterval(pingTimer);
+    pingTimer = null;
+  }
 });
 </script>
 
 <style scoped>
+.clock { margin: 0 0 12px; text-align: center; font-size: 56px; font-weight: 700; transition: font-size 200ms ease, margin 200ms ease; }
+.clock.focus { font-size: 96px; margin-bottom: 16px; }
 .row { display:flex; gap: 8px; flex-wrap: wrap; }
+.msgRow { display:flex; gap: 8px; flex-wrap: nowrap; align-items: center; }
+.msgInput { flex: 1; min-width: 0; }
 .muted { color: #666; }
+.grid { display:flex; gap: 12px; flex-wrap: wrap; }
+.thumb { width: 220px; }
+.thumb img { width: 220px; max-width: 100%; border-radius: 8px; border: 1px solid #ddd; }
+
+.fade-slide-enter-active,
+.fade-slide-leave-active { transition: opacity 180ms ease, transform 180ms ease; }
+.fade-slide-enter-from,
+.fade-slide-leave-to { opacity: 0; transform: translateY(10px); }
 </style>

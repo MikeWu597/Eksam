@@ -1,6 +1,6 @@
 # Eksam Candidate App
 
-考生端（Vue 3 + Element Plus）。通过 Socket.IO（底层 WebSocket，支持 `wss`）接收服务端指令；当收到 `试卷检查/收卷` 指令时拍照并上传。
+考生端（Vue 3 + Element Plus）。通过 WebSocket（ws/wss）接收服务端指令；当收到 `试卷检查/收卷` 指令时拍照并上传。
 
 ## 考试计时
 

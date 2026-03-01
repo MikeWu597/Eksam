@@ -1,20 +1,9 @@
 import { Capacitor, registerPlugin } from '@capacitor/core';
-import ioImport from 'socket.io-client';
 
 const NativeWs = registerPlugin('NativeWs');
 
 export function isNativeWsAvailable() {
   return Capacitor.isNativePlatform();
-}
-
-function parseWsLikeUrl(url) {
-  const u = new URL(url);
-  const protocol = u.protocol === 'wss:' ? 'https:' : 'http:';
-  const baseUrl = `${protocol}//${u.host}`;
-  const path = u.pathname || '/ws';
-  const query = {};
-  for (const [k, v] of u.searchParams.entries()) query[k] = v;
-  return { baseUrl, path, query };
 }
 
 /**
@@ -78,8 +67,6 @@ export function createWsClient(url) {
     return { kind: 'native', api };
   }
 
-  const { baseUrl, path, query } = parseWsLikeUrl(url);
-
   const handlers = {
     open: [],
     close: [],
@@ -87,56 +74,37 @@ export function createWsClient(url) {
     message: [],
   };
 
-  const io = ioImport?.default || ioImport;
-  const socket = io(baseUrl, {
-    path,
-    query,
-    autoConnect: false,
-    reconnection: true,
-  });
-
-  socket.on('connect', () => {
-    for (const fn of handlers.open) fn({ url });
-  });
-
-  socket.on('disconnect', (reason) => {
-    for (const fn of handlers.close) fn({ reason });
-  });
-
-  socket.on('connect_error', (err) => {
-    const extra = [];
-    if (err?.type) extra.push(String(err.type));
-    if (err?.description) extra.push(String(err.description));
-    const msg = [err?.message || 'CONNECT_ERROR', ...extra].filter(Boolean).join(' | ');
-    for (const fn of handlers.error) fn({ message: msg });
-  });
-
-  socket.on('error', (err) => {
-    for (const fn of handlers.error) fn({ message: err?.message || 'ERROR' });
-  });
-
-  socket.on('message', (data) => {
-    const text = (typeof data === 'string') ? data : JSON.stringify(data);
-    for (const fn of handlers.message) fn({ text });
-  });
+  let socket = null;
 
   const api = {
     async connect() {
-      socket.connect();
+      if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
+      socket = new WebSocket(url);
+      socket.onopen = (ev) => {
+        for (const fn of handlers.open) fn(ev);
+      };
+      socket.onclose = (ev) => {
+        for (const fn of handlers.close) fn(ev);
+      };
+      socket.onerror = () => {
+        for (const fn of handlers.error) fn({ message: 'WEBSOCKET_ERROR' });
+      };
+      socket.onmessage = (ev) => {
+        for (const fn of handlers.message) fn({ text: ev.data });
+      };
     },
     async close() {
-      try { socket.disconnect(); } catch {}
+      try { socket?.close?.(); } catch {}
+      socket = null;
     },
     async send(text) {
-      socket.send(text);
+      socket?.send?.(text);
     },
     on(event, fn) {
       handlers[event]?.push(fn);
     },
     async dispose() {
       try { await api.close(); } catch {}
-      try { socket.removeAllListeners(); } catch {}
-      try { socket.close?.(); } catch {}
     },
   };
 

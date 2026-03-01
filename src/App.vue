@@ -205,7 +205,7 @@ const photoHint = computed(() => {
 function wsUrl() {
   const u = new URL(serverUrl);
   u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
-  u.pathname = '/socket.io';
+  u.pathname = '/ws';
   u.search = '?role=candidate';
   return u.toString();
 }

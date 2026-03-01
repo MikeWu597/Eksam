@@ -8,18 +8,23 @@ import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 
+import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
-import java.net.URI;
-import java.net.URISyntaxException;
 import java.util.concurrent.TimeUnit;
 
-import io.socket.client.IO;
-import io.socket.client.Socket;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+import okhttp3.WebSocket;
+import okhttp3.WebSocketListener;
+import okio.ByteString;
 
 @CapacitorPlugin(name = "NativeWs")
 public class NativeWsPlugin extends Plugin {
-  private Socket socket;
+  private OkHttpClient client;
+  private WebSocket webSocket;
+  private volatile boolean isOpen = false;
   private String currentUrl;
 
   @Override
@@ -36,86 +41,81 @@ public class NativeWsPlugin extends Plugin {
     }
 
     currentUrl = url.trim();
+    disconnectInternal();
 
-    // Socket.IO Java client expects http/https base URL and uses a configurable "path" for the Engine.IO endpoint.
-    // We accept a ws/wss-like URL (e.g. wss://host/ws?role=candidate) and convert it.
-    String httpLikeUrl = currentUrl;
-    if (httpLikeUrl.startsWith("ws://")) httpLikeUrl = "http://" + httpLikeUrl.substring("ws://".length());
-    if (httpLikeUrl.startsWith("wss://")) httpLikeUrl = "https://" + httpLikeUrl.substring("wss://".length());
-
-    URI uri;
-    try {
-      uri = new URI(httpLikeUrl);
-    } catch (URISyntaxException e) {
-      call.reject("INVALID_URL", e);
-      return;
+    if (client == null) {
+      client = new OkHttpClient.Builder()
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .writeTimeout(20, TimeUnit.SECONDS)
+        .pingInterval(15, TimeUnit.SECONDS)
+        .build();
     }
 
-    String scheme = uri.getScheme();
-    String host = uri.getHost();
-    int port = uri.getPort();
-    if (scheme == null || host == null) {
+    Request request;
+    try {
+      request = new Request.Builder().url(currentUrl).build();
+    } catch (IllegalArgumentException e) {
       JSObject info = new JSObject();
       info.put("raw", currentUrl);
-      info.put("httpLike", httpLikeUrl);
-      info.put("scheme", scheme);
-      info.put("host", host);
-      info.put("port", port);
+      info.put("message", e.getMessage());
+      info.put("name", e.getClass().getName());
       call.reject("INVALID_URL", info);
       return;
     }
 
-    String baseUrl = scheme + "://" + host + (port != -1 ? (":" + port) : "");
-    String path = uri.getPath();
-    if (path == null || path.trim().isEmpty()) path = "/ws";
-    String query = uri.getQuery();
+    webSocket = client.newWebSocket(request, new WebSocketListener() {
+      @Override
+      public void onOpen(WebSocket ws, Response response) {
+        isOpen = true;
+        JSObject data = new JSObject();
+        data.put("url", currentUrl);
+        if (response != null) {
+          data.put("httpCode", response.code());
+          data.put("httpMessage", response.message());
+        }
+        notifyListeners("open", data);
+      }
 
-    closeSocket();
+      @Override
+      public void onMessage(WebSocket ws, String text) {
+        JSObject data = new JSObject();
+        data.put("text", text != null ? text : "");
+        notifyListeners("message", data);
+      }
 
-    IO.Options opts = new IO.Options();
-    opts.path = path;
-    opts.query = query;
-    opts.reconnection = true;
-    opts.forceNew = true;
-    opts.timeout = TimeUnit.SECONDS.toMillis(20);
+      @Override
+      public void onMessage(WebSocket ws, ByteString bytes) {
+        JSObject data = new JSObject();
+        data.put("text", bytes != null ? bytes.utf8() : "");
+        notifyListeners("message", data);
+      }
 
-    try {
-      socket = IO.socket(baseUrl, opts);
-    } catch (Exception e) {
-      JSObject info = new JSObject();
-      info.put("raw", currentUrl);
-      info.put("baseUrl", baseUrl);
-      info.put("path", path);
-      info.put("query", query);
-      info.put("message", e.getMessage());
-      info.put("name", e.getClass().getName());
-      call.reject("CONNECT_INIT_FAILED", info);
-      return;
-    }
+      @Override
+      public void onClosing(WebSocket ws, int code, String reason) {
+        isOpen = false;
+        JSObject data = new JSObject();
+        data.put("code", code);
+        data.put("reason", reason != null ? reason : "");
+        notifyListeners("close", data);
+        ws.close(code, reason);
+      }
 
-    socket.on(Socket.EVENT_CONNECT, (args) -> {
-      JSObject data = new JSObject();
-      data.put("url", currentUrl);
-      notifyListeners("open", data);
+      @Override
+      public void onClosed(WebSocket ws, int code, String reason) {
+        isOpen = false;
+        JSObject data = new JSObject();
+        data.put("code", code);
+        data.put("reason", reason != null ? reason : "");
+        notifyListeners("close", data);
+      }
+
+      @Override
+      public void onFailure(WebSocket ws, Throwable t, Response response) {
+        isOpen = false;
+        notifyError(t, response);
+      }
     });
-
-    socket.on("message", (args) -> {
-      Object first = (args != null && args.length > 0) ? args[0] : null;
-      JSObject data = new JSObject();
-      data.put("text", first != null ? String.valueOf(first) : "");
-      notifyListeners("message", data);
-    });
-
-    socket.on(Socket.EVENT_DISCONNECT, (args) -> {
-      JSObject data = new JSObject();
-      data.put("reason", (args != null && args.length > 0) ? String.valueOf(args[0]) : "DISCONNECT");
-      notifyListeners("close", data);
-    });
-
-    socket.on(Socket.EVENT_CONNECT_ERROR, (args) -> notifyError(args));
-    socket.on("error", (args) -> notifyError(args));
-
-    socket.connect();
 
     JSObject ret = new JSObject();
     ret.put("ok", true);
@@ -125,7 +125,7 @@ public class NativeWsPlugin extends Plugin {
 
   @PluginMethod
   public void disconnect(PluginCall call) {
-    closeSocket();
+    disconnectInternal();
     JSObject ret = new JSObject();
     ret.put("ok", true);
     call.resolve(ret);
@@ -138,11 +138,27 @@ public class NativeWsPlugin extends Plugin {
       call.reject("MISSING_TEXT");
       return;
     }
-    if (socket == null || socket.connected() != true) {
+    if (webSocket == null || !isOpen) {
       call.reject("NOT_CONNECTED");
       return;
     }
-    socket.send(text);
+
+    boolean ok;
+    try {
+      ok = webSocket.send(text);
+    } catch (Exception e) {
+      JSObject info = new JSObject();
+      info.put("message", e.getMessage());
+      info.put("name", e.getClass().getName());
+      call.reject("SEND_FAILED", info);
+      return;
+    }
+
+    if (!ok) {
+      call.reject("SEND_FAILED");
+      return;
+    }
+
     JSObject ret = new JSObject();
     ret.put("ok", true);
     call.resolve(ret);
@@ -151,35 +167,29 @@ public class NativeWsPlugin extends Plugin {
   @PluginMethod
   public void status(PluginCall call) {
     JSObject ret = new JSObject();
-    ret.put("connected", socket != null && socket.connected() == true);
+    ret.put("connected", webSocket != null && isOpen);
     ret.put("url", currentUrl);
     call.resolve(ret);
   }
 
-  private void closeSocket() {
-    if (socket != null) {
+  private void disconnectInternal() {
+    WebSocket ws = webSocket;
+    webSocket = null;
+    isOpen = false;
+
+    if (ws != null) {
       try {
-        socket.off();
+        ws.close(1000, "CLIENT_CLOSE");
       } catch (Exception ignored) {
       }
       try {
-        socket.disconnect();
+        ws.cancel();
       } catch (Exception ignored) {
       }
-      try {
-        socket.close();
-      } catch (Exception ignored) {
-      }
-      socket = null;
     }
   }
 
-  private void notifyError(@Nullable Object[] args) {
-    Throwable t = null;
-    if (args != null && args.length > 0 && args[0] instanceof Throwable) {
-      t = (Throwable) args[0];
-    }
-
+  private void notifyError(@Nullable Throwable t, @Nullable Response response) {
     JSObject data = new JSObject();
     if (t != null) {
       data.put("message", t.getMessage());
@@ -192,12 +202,14 @@ public class NativeWsPlugin extends Plugin {
         data.put("stack", sw.toString());
       } catch (Exception ignored) {
       }
-    } else {
-      String msg = "CONNECT_ERROR";
-      if (args != null && args.length > 0 && args[0] != null) {
-        msg = String.valueOf(args[0]);
+    }
+    if (response != null) {
+      data.put("httpCode", response.code());
+      data.put("httpMessage", response.message());
+      try {
+        data.put("httpBody", response.body() != null ? response.body().string() : null);
+      } catch (IOException ignored) {
       }
-      data.put("message", msg);
     }
     notifyListeners("error", data);
   }
